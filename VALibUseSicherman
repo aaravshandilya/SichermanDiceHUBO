@@ -1,0 +1,730 @@
+"""
+Sicherman Dice using NEC Vector Annealing
+=========================================
+
+This program:
+
+1. Defines the Sicherman Dice problem as a symbolic HUBO.
+2. Uses PyQUBO to quadratize the cubic/quartic terms.
+3. Produces a standard QUBO dictionary and energy offset.
+4. Solves the QUBO using NEC Vector Annealing.
+5. Decodes and validates the resulting dice.
+
+Target nontrivial solution, allowing the dice to be swapped:
+
+    {1, 2, 2, 3, 3, 4}
+    {1, 3, 4, 5, 6, 8}
+
+Requirements on the NEC system:
+
+    pyqubo
+    VectorAnnealing
+"""
+
+from collections import Counter
+import os
+import sys
+import tempfile
+import time
+
+try:
+    from pyqubo import Binary
+except ImportError as exc:
+    raise SystemExit(
+        "PyQUBO is not available.\n"
+        "Load the NEC/BasePy environment before running this program."
+    ) from exc
+
+try:
+    import VectorAnnealing
+except ImportError as exc:
+    raise SystemExit(
+        "The NEC VectorAnnealing module is not available.\n"
+        "Load the Vector Annealing module before running this program."
+    ) from exc
+
+
+# ======================================================================
+# Parameters
+# ======================================================================
+
+N_FACES = 6
+
+# Restrict one die so that the trivial pair {1,2,3,4,5,6} / {1,2,3,4,5,6}
+# cannot be represented.
+VMAX_A = 4
+VMAX_B = 11
+
+VALUES_A = range(1, VMAX_A + 1)
+VALUES_B = range(1, VMAX_B + 1)
+
+# Penalty enforcing exactly one value per physical face.
+ONE_HOT_PENALTY = 150.0
+
+# Penalty used by PyQUBO when replacing products such as x*y with
+# auxiliary binary variables.
+#
+# This should generally be larger than the coefficients in the original
+# objective. Increase it if PyQUBO reports broken reduction constraints.
+REDUCTION_STRENGTH = 1000.0
+
+# NEC Vector Annealing settings.
+# One invocation of the NEC sampler is made.
+# It performs multiple internal annealing reads for reliability but returns
+# only the single best solution.
+NUM_READS = 10
+NUM_RESULTS = 1
+NUM_SWEEPS = 500
+NUM_THREADS = -1
+
+# Fixed seed gives reproducible results when spin ordering is fixed.
+RANDOM_SEED = 42
+
+# Inverse-temperature schedule: [start_beta, end_beta, number_of_steps].
+BETA_RANGE = [10.0, 100.0, 200]
+
+
+# ======================================================================
+# Target distribution
+# ======================================================================
+
+def standard_dice_distribution():
+    """Return the sum distribution of two ordinary six-sided dice."""
+
+    target = Counter()
+
+    for a in range(1, 7):
+        for b in range(1, 7):
+            target[a + b] += 1
+
+    return dict(target)
+
+
+TARGET = standard_dice_distribution()
+
+
+# ======================================================================
+# Binary variables
+# ======================================================================
+
+def variable_a(face, value):
+    """Return the name of an A-die binary variable."""
+
+    return f"A_{face}_{value}"
+
+
+def variable_b(face, value):
+    """Return the name of a B-die binary variable."""
+
+    return f"B_{face}_{value}"
+
+
+# x[(i,v)] = 1 when physical face i of die A has label v.
+x = {
+    (i, v): Binary(variable_a(i, v))
+    for i in range(N_FACES)
+    for v in VALUES_A
+}
+
+# y[(j,w)] = 1 when physical face j of die B has label w.
+y = {
+    (j, w): Binary(variable_b(j, w))
+    for j in range(N_FACES)
+    for w in VALUES_B
+}
+
+
+# ======================================================================
+# Build the symbolic HUBO
+# ======================================================================
+
+def build_distribution_objective():
+    """
+    Construct the sum-distribution matching objective.
+
+    For each possible sum s:
+
+        observed_s =
+            sum_{i,j,v,w : v+w=s} x[i,v] y[j,w]
+
+    The objective contains:
+
+        (observed_s - target_s)^2
+
+    Since observed_s is quadratic, squaring it creates terms with degree
+    as high as four. PyQUBO will later reduce these terms to quadratic
+    form using auxiliary binary variables.
+    """
+
+    objective = 0
+
+    maximum_sum = VMAX_A + VMAX_B
+
+    for total in range(2, maximum_sum + 1):
+        expected_count = TARGET.get(total, 0)
+
+        observed_count = 0
+
+        for value_a in VALUES_A:
+            value_b = total - value_a
+
+            if value_b not in VALUES_B:
+                continue
+
+            for face_a in range(N_FACES):
+                for face_b in range(N_FACES):
+                    observed_count += (
+                        x[(face_a, value_a)]
+                        * y[(face_b, value_b)]
+                    )
+
+        objective += (observed_count - expected_count) ** 2
+
+    return objective
+
+
+def build_one_hot_penalties():
+    """
+    Enforce exactly one selected label for every physical die face.
+    """
+
+    penalties = 0
+
+    for face in range(N_FACES):
+        selected_values = sum(
+            x[(face, value)]
+            for value in VALUES_A
+        )
+
+        penalties += (selected_values - 1) ** 2
+
+    for face in range(N_FACES):
+        selected_values = sum(
+            y[(face, value)]
+            for value in VALUES_B
+        )
+
+        penalties += (selected_values - 1) ** 2
+
+    return ONE_HOT_PENALTY * penalties
+
+
+print("=" * 70)
+print("SICHERMAN DICE — NEC VECTOR ANNEALING")
+print("=" * 70)
+
+print("\nBuilding symbolic HUBO...")
+
+distribution_objective = build_distribution_objective()
+one_hot_objective = build_one_hot_penalties()
+
+hamiltonian = distribution_objective + one_hot_objective
+
+
+# ======================================================================
+# Quadratize with PyQUBO
+# ======================================================================
+
+print("Quadratizing HUBO with PyQUBO...")
+
+compile_start = time.perf_counter()
+
+# PyQUBO introduces auxiliary variables for higher-order products.
+compiled_model = hamiltonian.compile(
+    strength=REDUCTION_STRENGTH
+)
+
+qubo, offset = compiled_model.to_qubo()
+
+compile_time = time.perf_counter() - compile_start
+
+
+# ======================================================================
+# Inspect the resulting QUBO
+# ======================================================================
+
+original_variable_names = {
+    variable_a(i, v)
+    for i in range(N_FACES)
+    for v in VALUES_A
+}
+
+original_variable_names.update(
+    variable_b(j, w)
+    for j in range(N_FACES)
+    for w in VALUES_B
+)
+
+all_variable_names = set()
+
+for variable_1, variable_2 in qubo:
+    all_variable_names.add(variable_1)
+    all_variable_names.add(variable_2)
+
+auxiliary_variable_names = (
+    all_variable_names - original_variable_names
+)
+
+linear_terms = sum(
+    1
+    for variable_1, variable_2 in qubo
+    if variable_1 == variable_2
+)
+
+quadratic_terms = sum(
+    1
+    for variable_1, variable_2 in qubo
+    if variable_1 != variable_2
+)
+
+print("\nQUBO statistics")
+print("-" * 70)
+print(f"Original logical variables: {len(original_variable_names)}")
+print(f"Auxiliary variables:        {len(auxiliary_variable_names)}")
+print(f"Total QUBO variables:       {len(all_variable_names)}")
+print(f"Linear QUBO terms:          {linear_terms}")
+print(f"Quadratic QUBO terms:       {quadratic_terms}")
+print(f"Total nonzero QUBO terms:   {len(qubo)}")
+print(f"QUBO offset:                {offset}")
+print(f"Compilation time:           {compile_time:.4f} seconds")
+
+
+# Confirm that every output term is linear or quadratic.
+invalid_terms = [
+    term
+    for term in qubo
+    if len(term) != 2
+]
+
+if invalid_terms:
+    raise RuntimeError(
+        "The compiled model contains invalid non-QUBO terms."
+    )
+
+print("\nQuadratization verification: PASSED")
+print("Every Hamiltonian term is now linear or quadratic.")
+
+
+# ======================================================================
+# Optional NEC one-hot flip constraints
+# ======================================================================
+
+# These constraints are also present in the Hamiltonian. Providing them
+# to NEC's onehot option may improve the search because Vector Annealing
+# can use one-hot-aware moves.
+one_hot_groups = []
+
+for face in range(N_FACES):
+    one_hot_groups.append(
+        [
+            variable_a(face, value)
+            for value in VALUES_A
+        ]
+    )
+
+for face in range(N_FACES):
+    one_hot_groups.append(
+        [
+            variable_b(face, value)
+            for value in VALUES_B
+        ]
+    )
+
+
+# Use a fixed spin ordering to improve seed reproducibility.
+spin_list = sorted(all_variable_names)
+
+
+# ======================================================================
+# Create and solve the NEC Vector Annealing model
+# ======================================================================
+
+print("\nPreparing NEC Vector Annealing...")
+
+print("Running one NEC sampler call...")
+print(f"Internal annealing reads:   {NUM_READS}")
+print(f"Returned best results:      {NUM_RESULTS}")
+print(f"Sweeps per read:            {NUM_SWEEPS}")
+print(f"Seed:                       {RANDOM_SEED}")
+
+annealing_start = time.perf_counter()
+
+# NEC Vector Annealing creates files such as:
+#
+#     qubo-XXXX.bin
+#     out-XXXX.bin0
+#     out-XXXX.bin1
+#
+# They are implementation-specific temporary files. To keep the project and
+# virtual-environment directories clean, create and run the NEC model inside
+# a temporary directory. Python deletes the directory and all .bin files when
+# this block finishes, including when the sampler raises an exception.
+original_directory = os.getcwd()
+
+with tempfile.TemporaryDirectory(
+    prefix="sicherman_nec_va_"
+) as nec_work_directory:
+    try:
+        os.chdir(nec_work_directory)
+
+        va_model = VectorAnnealing.model(
+            qubo,
+            offset,
+            onehot=one_hot_groups,
+            spin_list=spin_list,
+        )
+
+        sampler = VectorAnnealing.sampler()
+
+        # Exactly one sampler.sample() call is made. NUM_READS gives the
+        # annealer several chances to reach the optimum, while NUM_RESULTS=1
+        # returns only the best final solution.
+        results = sampler.sample(
+            va_model,
+            num_reads=NUM_READS,
+            num_results=NUM_RESULTS,
+            num_sweeps=NUM_SWEEPS,
+            num_threads=NUM_THREADS,
+            beta_range=BETA_RANGE,
+            seed=RANDOM_SEED,
+        )
+
+    finally:
+        os.chdir(original_directory)
+
+annealing_wall_time = time.perf_counter() - annealing_start
+
+if not results:
+    raise RuntimeError(
+        "NEC Vector Annealing returned no results."
+    )
+
+print(
+    f"Vector Annealing wall time: "
+    f"{annealing_wall_time:.4f} seconds"
+)
+print("Temporary NEC .bin files were deleted automatically.")
+
+
+# ======================================================================
+# Decode the results
+# ======================================================================
+
+def decode_die(sample, prefix, allowed_values):
+    """
+    Decode one die from a binary sample.
+
+    Returns:
+        faces:
+            List of decoded face labels.
+
+        valid:
+            True when each physical face has exactly one selected label.
+
+        face_selections:
+            Selected label list for each physical face.
+    """
+
+    faces = []
+    valid = True
+    face_selections = []
+
+    for face in range(N_FACES):
+        chosen = [
+            value
+            for value in allowed_values
+            if int(sample.get(
+                f"{prefix}_{face}_{value}",
+                0
+            )) == 1
+        ]
+
+        face_selections.append(chosen)
+
+        if len(chosen) != 1:
+            valid = False
+            faces.append(None)
+        else:
+            faces.append(chosen[0])
+
+    return faces, valid, face_selections
+
+
+def resulting_distribution(die_a, die_b):
+    """Calculate the sum-count distribution of two decoded dice."""
+
+    counts = Counter()
+
+    for face_a in die_a:
+        for face_b in die_b:
+            counts[face_a + face_b] += 1
+
+    return dict(sorted(counts.items()))
+
+
+def distribution_error(counts):
+    """
+    Return the original sum-of-squared-errors objective.
+
+    This excludes one-hot and quadratization penalties.
+    """
+
+    maximum_sum = VMAX_A + VMAX_B
+
+    return sum(
+        (
+            counts.get(total, 0)
+            - TARGET.get(total, 0)
+        ) ** 2
+        for total in range(2, maximum_sum + 1)
+    )
+
+
+def one_hot_violations(sample):
+    """Count physical faces that do not select exactly one label."""
+
+    violations = 0
+
+    for face in range(N_FACES):
+        selected = sum(
+            int(sample.get(variable_a(face, value), 0))
+            for value in VALUES_A
+        )
+
+        if selected != 1:
+            violations += 1
+
+    for face in range(N_FACES):
+        selected = sum(
+            int(sample.get(variable_b(face, value), 0))
+            for value in VALUES_B
+        )
+
+        if selected != 1:
+            violations += 1
+
+    return violations
+
+
+def is_trivial_standard_pair(die_a, die_b):
+    """Check whether both decoded dice are ordinary dice."""
+
+    standard = [1, 2, 3, 4, 5, 6]
+
+    return (
+        sorted(die_a) == standard
+        and sorted(die_b) == standard
+    )
+
+
+def result_constraint_status(result):
+    """Read NEC's optional constraint-status field safely."""
+
+    return getattr(result, "constraint", None)
+
+
+# NEC generally returns results ordered by energy, but we explicitly sort
+# them to avoid relying on that behavior.
+sorted_results = sorted(
+    results,
+    key=lambda result: float(result.energy)
+)
+
+best_valid_result = None
+best_valid_data = None
+
+print("\nEvaluating returned samples...")
+
+for result_index, result in enumerate(sorted_results):
+    sample = result.spin
+
+    die_a, valid_a, selections_a = decode_die(
+        sample,
+        "A",
+        VALUES_A,
+    )
+
+    die_b, valid_b, selections_b = decode_die(
+        sample,
+        "B",
+        VALUES_B,
+    )
+
+    if not valid_a or not valid_b:
+        continue
+
+    counts = resulting_distribution(die_a, die_b)
+    error = distribution_error(counts)
+
+    candidate_data = {
+        "index": result_index,
+        "sample": sample,
+        "die_a": die_a,
+        "die_b": die_b,
+        "counts": counts,
+        "distribution_error": error,
+        "energy": float(result.energy),
+        "one_hot_violations": one_hot_violations(sample),
+        "constraint": result_constraint_status(result),
+        "time": getattr(result, "time", None),
+        "selections_a": selections_a,
+        "selections_b": selections_b,
+    }
+
+    if best_valid_data is None:
+        best_valid_result = result
+        best_valid_data = candidate_data
+
+    if error == 0:
+        best_valid_result = result
+        best_valid_data = candidate_data
+        break
+
+
+# ======================================================================
+# Print the result
+# ======================================================================
+
+print("\n" + "=" * 70)
+print("RESULT")
+print("=" * 70)
+
+if best_valid_result is None:
+    lowest_result = sorted_results[0]
+
+    print("No returned sample satisfied all one-hot constraints.")
+    print(f"Lowest reported QUBO energy: {lowest_result.energy}")
+    print(
+        "Increase NUM_READS, NUM_SWEEPS, ONE_HOT_PENALTY, or "
+        "REDUCTION_STRENGTH."
+    )
+
+    sys.exit(1)
+
+
+die_a = best_valid_data["die_a"]
+die_b = best_valid_data["die_b"]
+counts = best_valid_data["counts"]
+match = counts == TARGET
+
+print(f"Selected result number:      {best_valid_data['index']}")
+print(f"NEC-reported QUBO energy:    {best_valid_data['energy']}")
+print(
+    f"Distribution error:         "
+    f"{best_valid_data['distribution_error']}"
+)
+print(
+    f"One-hot violations:         "
+    f"{best_valid_data['one_hot_violations']}"
+)
+print(
+    f"NEC constraint status:      "
+    f"{best_valid_data['constraint']}"
+)
+
+if best_valid_data["time"] is not None:
+    print(
+        f"NEC-reported solve time:    "
+        f"{best_valid_data['time']} seconds"
+    )
+
+print(f"\nDie A faces: {sorted(die_a)}")
+print(f"Die B faces: {sorted(die_b)}")
+
+print("\nSum distribution")
+print("-" * 70)
+print("Sum | Obtained | Target | Difference")
+print("-" * 70)
+
+for total in range(2, 13):
+    obtained = counts.get(total, 0)
+    expected = TARGET.get(total, 0)
+
+    print(
+        f"{total:>3} | "
+        f"{obtained:>8} | "
+        f"{expected:>6} | "
+        f"{obtained - expected:>10}"
+    )
+
+# There must also be no counts outside 2 through 12.
+outside_target = {
+    total: count
+    for total, count in counts.items()
+    if total < 2 or total > 12
+}
+
+print("\nTarget distribution:")
+print(dict(sorted(TARGET.items())))
+
+print("\nObtained distribution:")
+print(counts)
+
+print(f"\nExact distribution match: {match}")
+
+if outside_target:
+    print(
+        "Unexpected sums outside 2 through 12:",
+        outside_target,
+    )
+
+
+# ======================================================================
+# Decode PyQUBO constraints and auxiliary-variable consistency
+# ======================================================================
+
+try:
+    decoded_sample = compiled_model.decode_sample(
+        best_valid_result.spin,
+        vartype="BINARY",
+    )
+
+    broken_constraints = decoded_sample.constraints(
+        only_broken=True
+    )
+
+    print(
+        f"PyQUBO decoded energy:       "
+        f"{decoded_sample.energy}"
+    )
+
+    print(
+        f"Broken PyQUBO constraints:   "
+        f"{broken_constraints}"
+    )
+
+except Exception as error:
+    # This diagnostic is useful but is not required for validating the
+    # physical dice.
+    print(
+        "\nPyQUBO diagnostic decoding was unavailable:",
+        error,
+    )
+
+
+# ======================================================================
+# Final interpretation
+# ======================================================================
+
+print("\n" + "=" * 70)
+
+if not match:
+    print("The annealer did not reach the exact Sicherman solution.")
+    print(
+        "This stochastic run did not reach the exact solution.\n"
+        "Increase NUM_READS or NUM_SWEEPS and run the same file again."
+    )
+
+    sys.exit(2)
+
+if is_trivial_standard_pair(die_a, die_b):
+    print("A trivial standard-dice pair was found.")
+    print(
+        "This should not be representable because die A is restricted "
+        "to values 1 through 4."
+    )
+
+    sys.exit(3)
+
+print("NONTRIVIAL SICHERMAN SOLUTION FOUND AND VERIFIED.")
+print("=" * 70)
