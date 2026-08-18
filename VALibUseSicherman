@@ -78,7 +78,7 @@ NUM_SWEEPS = 500
 NUM_THREADS = -1
 
 # Fixed seed gives reproducible results when spin ordering is fixed.
-RANDOM_SEED = 42
+RANDOM_SEED = 137
 
 # Inverse-temperature schedule: [start_beta, end_beta, number_of_steps].
 BETA_RANGE = [10.0, 100.0, 200]
