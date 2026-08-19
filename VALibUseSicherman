@@ -23,6 +23,7 @@ Requirements on the NEC system:
 
 from collections import Counter
 import os
+import random
 import sys
 import tempfile
 import time
@@ -69,12 +70,12 @@ ONE_HOT_PENALTY = 150.0
 REDUCTION_STRENGTH = 1000.0
 
 # NEC Vector Annealing settings.
-# One invocation of the NEC sampler is made.
-# It performs multiple internal annealing reads for reliability but returns
-# only the single best solution.
-NUM_READS = 10
-NUM_RESULTS = 1
-NUM_SWEEPS = 500
+# One invocation of the NEC sampler is made. It performs multiple internal
+# annealing reads and returns several candidates so rejected samples can be
+# diagnosed instead of hiding every result except the lowest-energy sample.
+NUM_READS = 20
+NUM_RESULTS = 20
+NUM_SWEEPS = 5000
 NUM_THREADS = -1
 
 # Fixed seed gives reproducible results when spin ordering is fixed.
@@ -335,6 +336,38 @@ for face in range(N_FACES):
 spin_list = sorted(all_variable_names)
 
 
+def build_valid_initial_spin():
+    """
+    Create a reproducible initial state that satisfies every physical-face
+    one-hot constraint. Auxiliary PyQUBO variables are intentionally omitted;
+    NEC may initialize those unspecified variables itself.
+    """
+
+    random_generator = random.Random(RANDOM_SEED)
+    initial_state = {}
+
+    for face in range(N_FACES):
+        selected_value = random_generator.choice(list(VALUES_A))
+
+        for value in VALUES_A:
+            initial_state[variable_a(face, value)] = int(
+                value == selected_value
+            )
+
+    for face in range(N_FACES):
+        selected_value = random_generator.choice(list(VALUES_B))
+
+        for value in VALUES_B:
+            initial_state[variable_b(face, value)] = int(
+                value == selected_value
+            )
+
+    return initial_state
+
+
+initial_spin = build_valid_initial_spin()
+
+
 # ======================================================================
 # Create and solve the NEC Vector Annealing model
 # ======================================================================
@@ -376,9 +409,8 @@ with tempfile.TemporaryDirectory(
 
         sampler = VectorAnnealing.sampler()
 
-        # Exactly one sampler.sample() call is made. NUM_READS gives the
-        # annealer several chances to reach the optimum, while NUM_RESULTS=1
-        # returns only the best final solution.
+        # Exactly one sampler.sample() call is made. Multiple reads and
+        # returned candidates make constraint failures observable.
         results = sampler.sample(
             va_model,
             num_reads=NUM_READS,
@@ -387,6 +419,7 @@ with tempfile.TemporaryDirectory(
             num_threads=NUM_THREADS,
             beta_range=BETA_RANGE,
             seed=RANDOM_SEED,
+            init_spin=initial_spin,
         )
 
     finally:
@@ -551,6 +584,20 @@ for result_index, result in enumerate(sorted_results):
     )
 
     if not valid_a or not valid_b:
+        returned_values = sorted(
+            set(sample.values()),
+            key=str,
+        )
+
+        print(f"\nRejected result {result_index}")
+        print(
+            "NEC constraint status:",
+            result_constraint_status(result),
+        )
+        print("Returned binary/spin values:", returned_values)
+        print("Die A selections by face:", selections_a)
+        print("Die B selections by face:", selections_b)
+
         continue
 
     counts = resulting_distribution(die_a, die_b)
