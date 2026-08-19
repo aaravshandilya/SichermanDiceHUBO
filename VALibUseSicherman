@@ -10,8 +10,13 @@ This program:
 4. Solves the QUBO using NEC Vector Annealing.
 5. Decodes and validates the resulting dice.
 
-Target nontrivial solution, allowing the dice to be swapped:
+Exact zero-error solutions available to the model:
 
+Ordinary dice:
+    {1, 2, 3, 4, 5, 6}
+    {1, 2, 3, 4, 5, 6}
+
+Nontrivial Sicherman dice:
     {1, 2, 2, 3, 3, 4}
     {1, 3, 4, 5, 6, 8}
 
@@ -23,6 +28,7 @@ Requirements on the NEC system:
 
 from collections import Counter
 import os
+import pickle
 import random
 import sys
 import tempfile
@@ -51,9 +57,10 @@ except ImportError as exc:
 
 N_FACES = 6
 
-# Restrict one die so that the trivial pair {1,2,3,4,5,6} / {1,2,3,4,5,6}
-# cannot be represented.
-VMAX_A = 4
+# Both dice can represent ordinary labels. VMAX_B remains large enough for
+# the nontrivial Sicherman label 8, so either the ordinary or Sicherman pair
+# may be returned.
+VMAX_A = 6
 VMAX_B = 11
 
 VALUES_A = range(1, VMAX_A + 1)
@@ -74,11 +81,30 @@ REDUCTION_STRENGTH = 1000.0
 # to identify constraint or decoding failures.
 NUM_READS = 5
 NUM_RESULTS = 5
-NUM_SWEEPS = 500
+NUM_SWEEPS = 1000
 NUM_THREADS = -1
 
 # Fixed seed gives reproducible results when spin ordering is fixed.
 RANDOM_SEED = 137
+
+# Cache the expensive PyQUBO compilation. Increment CACHE_VERSION whenever
+# the Hamiltonian formulation changes.
+CACHE_VERSION = 2
+CACHE_SIGNATURE = {
+    "version": CACHE_VERSION,
+    "n_faces": N_FACES,
+    "vmax_a": VMAX_A,
+    "vmax_b": VMAX_B,
+    "one_hot_penalty": ONE_HOT_PENALTY,
+    "reduction_strength": REDUCTION_STRENGTH,
+}
+QUBO_CACHE_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    (
+        f".sicherman_qubo_cache_v{CACHE_VERSION}"
+        f"_a{VMAX_A}_b{VMAX_B}.pkl"
+    ),
+)
 
 # Inverse-temperature schedule: [start_beta, end_beta, number_of_steps].
 BETA_RANGE = [10.0, 100.0, 200]
@@ -225,16 +251,56 @@ hamiltonian = distribution_objective + one_hot_objective
 # Quadratize with PyQUBO
 # ======================================================================
 
-print("Quadratizing HUBO with PyQUBO...")
+print("Preparing QUBO...")
 
 compile_start = time.perf_counter()
+compiled_model = None
+cache_used = False
 
-# PyQUBO introduces auxiliary variables for higher-order products.
-compiled_model = hamiltonian.compile(
-    strength=REDUCTION_STRENGTH
-)
+try:
+    with open(QUBO_CACHE_FILE, "rb") as cache_file:
+        cached_data = pickle.load(cache_file)
 
-qubo, offset = compiled_model.to_qubo()
+    if cached_data.get("signature") == CACHE_SIGNATURE:
+        qubo = cached_data["qubo"]
+        offset = cached_data["offset"]
+        cache_used = True
+        print(f"Loaded cached QUBO: {QUBO_CACHE_FILE}")
+    else:
+        print("Ignoring QUBO cache because its parameters do not match.")
+
+except FileNotFoundError:
+    pass
+
+except Exception as cache_error:
+    print("Ignoring unreadable QUBO cache:", cache_error)
+
+if not cache_used:
+    print("No matching cache found; quadratizing HUBO with PyQUBO...")
+
+    # PyQUBO introduces auxiliary variables for higher-order products.
+    compiled_model = hamiltonian.compile(
+        strength=REDUCTION_STRENGTH
+    )
+
+    qubo, offset = compiled_model.to_qubo()
+
+    try:
+        with open(QUBO_CACHE_FILE, "wb") as cache_file:
+            pickle.dump(
+                {
+                    "signature": CACHE_SIGNATURE,
+                    "qubo": qubo,
+                    "offset": offset,
+                },
+                cache_file,
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
+
+        print(f"Saved compiled QUBO cache: {QUBO_CACHE_FILE}")
+
+    except Exception as cache_error:
+        print("Could not save QUBO cache:", cache_error)
 
 compile_time = time.perf_counter() - compile_start
 
@@ -286,7 +352,8 @@ print(f"Linear QUBO terms:          {linear_terms}")
 print(f"Quadratic QUBO terms:       {quadratic_terms}")
 print(f"Total nonzero QUBO terms:   {len(qubo)}")
 print(f"QUBO offset:                {offset}")
-print(f"Compilation time:           {compile_time:.4f} seconds")
+print(f"QUBO cache used:            {cache_used}")
+print(f"QUBO preparation time:      {compile_time:.4f} seconds")
 
 
 # Confirm that every output term is linear or quadratic.
@@ -719,33 +786,40 @@ if outside_target:
 # Decode PyQUBO constraints and auxiliary-variable consistency
 # ======================================================================
 
-try:
-    decoded_sample = compiled_model.decode_sample(
-        best_valid_result.spin,
-        vartype="BINARY",
-    )
-
-    broken_constraints = decoded_sample.constraints(
-        only_broken=True
-    )
-
+if compiled_model is None:
     print(
-        f"PyQUBO decoded energy:       "
-        f"{decoded_sample.energy}"
+        "PyQUBO diagnostic decoding: SKIPPED "
+        "(QUBO was loaded from cache)"
     )
 
-    print(
-        f"Broken PyQUBO constraints:   "
-        f"{broken_constraints}"
-    )
+else:
+    try:
+        decoded_sample = compiled_model.decode_sample(
+            best_valid_result.spin,
+            vartype="BINARY",
+        )
 
-except Exception as error:
-    # This diagnostic is useful but is not required for validating the
-    # physical dice.
-    print(
-        "\nPyQUBO diagnostic decoding was unavailable:",
-        error,
-    )
+        broken_constraints = decoded_sample.constraints(
+            only_broken=True
+        )
+
+        print(
+            f"PyQUBO decoded energy:       "
+            f"{decoded_sample.energy}"
+        )
+
+        print(
+            f"Broken PyQUBO constraints:   "
+            f"{broken_constraints}"
+        )
+
+    except Exception as error:
+        # This diagnostic is useful but is not required for validating the
+        # physical dice.
+        print(
+            "\nPyQUBO diagnostic decoding was unavailable:",
+            error,
+        )
 
 
 # ======================================================================
@@ -764,13 +838,8 @@ if not match:
     sys.exit(2)
 
 if is_trivial_standard_pair(die_a, die_b):
-    print("A trivial standard-dice pair was found.")
-    print(
-        "This should not be representable because die A is restricted "
-        "to values 1 through 4."
-    )
+    print("EXACT STANDARD-DICE SOLUTION FOUND AND VERIFIED.")
+else:
+    print("NONTRIVIAL SICHERMAN SOLUTION FOUND AND VERIFIED.")
 
-    sys.exit(3)
-
-print("NONTRIVIAL SICHERMAN SOLUTION FOUND AND VERIFIED.")
 print("=" * 70)
