@@ -70,12 +70,11 @@ ONE_HOT_PENALTY = 150.0
 REDUCTION_STRENGTH = 1000.0
 
 # NEC Vector Annealing settings.
-# One invocation of the NEC sampler is made. It performs multiple internal
-# annealing reads and returns several candidates so rejected samples can be
-# diagnosed instead of hiding every result except the lowest-energy sample.
-NUM_READS = 20
-NUM_RESULTS = 20
-NUM_SWEEPS = 5000
+# Keep the diagnostic run lightweight while returning enough candidates
+# to identify constraint or decoding failures.
+NUM_READS = 5
+NUM_RESULTS = 5
+NUM_SWEEPS = 500
 NUM_THREADS = -1
 
 # Fixed seed gives reproducible results when spin ordering is fixed.
