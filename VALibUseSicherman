@@ -12,10 +12,10 @@ This version:
 
 Examples:
 
-    python3.8 VALibUseSicherman
-    python3.8 VALibUseSicherman --seed 137
-    python3.8 VALibUseSicherman --seed 137 --attempts 5
-    python3.8 VALibUseSicherman --attempts 1 --sweeps 500
+    python3.8 sicherman_nec_qubo.py
+    python3.8 sicherman_nec_qubo.py --seed 137
+    python3.8 sicherman_nec_qubo.py --seed 137 --attempts 5
+    python3.8 sicherman_nec_qubo.py --attempts 1 --sweeps 500
 """
 
 from collections import Counter
@@ -50,8 +50,14 @@ except ImportError as exc:
 
 N_FACES = 6
 
-# Die A is restricted to 1 through 4. This makes an ordinary die containing
-# labels 5 and 6 impossible while preserving [1, 2, 2, 3, 3, 4].
+# Die A is restricted to labels 1 through 4.
+#
+# This makes an ordinary die containing labels 5 and 6 impossible while
+# preserving the nontrivial Sicherman die:
+#
+#     [1, 2, 2, 3, 3, 4]
+#
+# Die B can use labels 1 through 11, which includes the required label 8.
 VMAX_A = 4
 VMAX_B = 11
 
@@ -65,12 +71,14 @@ DEFAULT_NUM_READS = 5
 DEFAULT_NUM_RESULTS = 5
 DEFAULT_NUM_SWEEPS = 1000
 DEFAULT_MAX_ATTEMPTS = 3
+
 NUM_THREADS = -1
 
 BETA_RANGE = [10.0, 100.0, 200]
 
 # Increment this whenever the Hamiltonian formulation changes.
 CACHE_VERSION = 2
+
 CACHE_SIGNATURE = {
     "version": CACHE_VERSION,
     "n_faces": N_FACES,
@@ -99,14 +107,18 @@ def positive_integer(value):
     parsed_value = int(value)
 
     if parsed_value < 1:
-        raise argparse.ArgumentTypeError("value must be at least 1")
+        raise argparse.ArgumentTypeError(
+            "value must be at least 1"
+        )
 
     return parsed_value
 
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description="Find Sicherman dice using NEC Vector Annealing."
+        description=(
+            "Find Sicherman dice using NEC Vector Annealing."
+        )
     )
 
     parser.add_argument(
@@ -114,8 +126,8 @@ def parse_arguments():
         type=int,
         default=None,
         help=(
-            "Base random seed. If omitted, a new random seed is chosen "
-            "for each program run."
+            "Base random seed. If omitted, a new random seed is "
+            "chosen for every program run."
         ),
     )
 
@@ -150,7 +162,9 @@ def parse_arguments():
     arguments = parser.parse_args()
 
     if arguments.results > arguments.reads:
-        parser.error("--results cannot be greater than --reads")
+        parser.error(
+            "--results cannot be greater than --reads"
+        )
 
     return arguments
 
@@ -158,7 +172,10 @@ def parse_arguments():
 ARGS = parse_arguments()
 
 if ARGS.seed is None:
-    BASE_SEED = random.SystemRandom().randrange(1, 2_000_000_000)
+    BASE_SEED = random.SystemRandom().randrange(
+        1,
+        2_000_000_000,
+    )
 else:
     BASE_SEED = ARGS.seed
 
@@ -183,10 +200,14 @@ TARGET = standard_dice_distribution()
 
 
 def variable_a(face, value):
+    """Return the variable name for one label on Die A."""
+
     return f"A_{face}_{value}"
 
 
 def variable_b(face, value):
+    """Return the variable name for one label on Die B."""
+
     return f"B_{face}_{value}"
 
 
@@ -215,23 +236,34 @@ def load_cached_qubo():
             cached_data = pickle.load(cache_file)
 
         if cached_data.get("signature") != CACHE_SIGNATURE:
-            print("Ignoring QUBO cache because its parameters do not match.")
+            print(
+                "Ignoring QUBO cache because its parameters "
+                "do not match."
+            )
             return None
 
         print(f"Loaded cached QUBO: {QUBO_CACHE_FILE}")
 
-        return cached_data["qubo"], cached_data["offset"]
+        return (
+            cached_data["qubo"],
+            cached_data["offset"],
+        )
 
     except FileNotFoundError:
         return None
 
     except Exception as cache_error:
-        print("Ignoring unreadable QUBO cache:", cache_error)
+        print(
+            "Ignoring unreadable QUBO cache:",
+            cache_error,
+        )
         return None
 
 
 def build_symbolic_hamiltonian():
-    """Build the face-label HUBO only when no cached QUBO is available."""
+    """
+    Build the face-label HUBO when no cached QUBO is available.
+    """
 
     x = {
         (face, value): Binary(variable_a(face, value))
@@ -277,7 +309,9 @@ def build_symbolic_hamiltonian():
             for value in VALUES_A
         )
 
-        one_hot_objective += (selected_values - 1) ** 2
+        one_hot_objective += (
+            selected_values - 1
+        ) ** 2
 
     for face in range(N_FACES):
         selected_values = sum(
@@ -285,7 +319,9 @@ def build_symbolic_hamiltonian():
             for value in VALUES_B
         )
 
-        one_hot_objective += (selected_values - 1) ** 2
+        one_hot_objective += (
+            selected_values - 1
+        ) ** 2
 
     return (
         distribution_objective
@@ -294,7 +330,7 @@ def build_symbolic_hamiltonian():
 
 
 def save_qubo_cache(qubo, offset):
-    """Save the QUBO so later runs can skip symbolic compilation."""
+    """Save the QUBO so later runs skip symbolic compilation."""
 
     try:
         with open(QUBO_CACHE_FILE, "wb") as cache_file:
@@ -308,10 +344,16 @@ def save_qubo_cache(qubo, offset):
                 protocol=pickle.HIGHEST_PROTOCOL,
             )
 
-        print(f"Saved compiled QUBO cache: {QUBO_CACHE_FILE}")
+        print(
+            f"Saved compiled QUBO cache: "
+            f"{QUBO_CACHE_FILE}"
+        )
 
     except Exception as cache_error:
-        print("Could not save QUBO cache:", cache_error)
+        print(
+            "Could not save QUBO cache:",
+            cache_error,
+        )
 
 
 def prepare_qubo():
@@ -328,34 +370,50 @@ def prepare_qubo():
             "offset": offset,
             "compiled_model": None,
             "cache_used": True,
-            "time": time.perf_counter() - preparation_start,
+            "time": (
+                time.perf_counter()
+                - preparation_start
+            ),
         }
 
-    print("No matching cache found; building symbolic HUBO...")
+    print(
+        "No matching cache found; building symbolic HUBO..."
+    )
+
     hamiltonian = build_symbolic_hamiltonian()
 
     print("Quadratizing HUBO with PyQUBO...")
+
     compiled_model = hamiltonian.compile(
         strength=REDUCTION_STRENGTH
     )
 
     qubo, offset = compiled_model.to_qubo()
-    save_qubo_cache(qubo, offset)
+
+    save_qubo_cache(
+        qubo,
+        offset,
+    )
 
     return {
         "qubo": qubo,
         "offset": offset,
         "compiled_model": compiled_model,
         "cache_used": False,
-        "time": time.perf_counter() - preparation_start,
+        "time": (
+            time.perf_counter()
+            - preparation_start
+        ),
     }
 
 
 # ======================================================================
-# Constraint and result helpers
+# One-hot constraint helpers
 # ======================================================================
 
 def build_one_hot_groups():
+    """Build one NEC one-hot group for each physical face."""
+
     groups = []
 
     for face in range(N_FACES):
@@ -384,25 +442,43 @@ def build_valid_initial_spin(seed):
     initial_state = {}
 
     for face in range(N_FACES):
-        selected_value = random_generator.choice(list(VALUES_A))
+        selected_value = random_generator.choice(
+            list(VALUES_A)
+        )
 
         for value in VALUES_A:
-            initial_state[variable_a(face, value)] = int(
+            initial_state[
+                variable_a(face, value)
+            ] = int(
                 value == selected_value
             )
 
     for face in range(N_FACES):
-        selected_value = random_generator.choice(list(VALUES_B))
+        selected_value = random_generator.choice(
+            list(VALUES_B)
+        )
 
         for value in VALUES_B:
-            initial_state[variable_b(face, value)] = int(
+            initial_state[
+                variable_b(face, value)
+            ] = int(
                 value == selected_value
             )
 
     return initial_state
 
 
-def decode_die(sample, prefix, allowed_values):
+# ======================================================================
+# Result decoding and validation
+# ======================================================================
+
+def decode_die(
+    sample,
+    prefix,
+    allowed_values,
+):
+    """Decode one die from an NEC binary sample."""
+
     faces = []
     valid = True
     face_selections = []
@@ -412,7 +488,10 @@ def decode_die(sample, prefix, allowed_values):
             value
             for value in allowed_values
             if int(
-                sample.get(f"{prefix}_{face}_{value}", 0)
+                sample.get(
+                    f"{prefix}_{face}_{value}",
+                    0,
+                )
             ) == 1
         ]
 
@@ -424,20 +503,35 @@ def decode_die(sample, prefix, allowed_values):
         else:
             faces.append(chosen[0])
 
-    return faces, valid, face_selections
+    return (
+        faces,
+        valid,
+        face_selections,
+    )
 
 
-def resulting_distribution(die_a, die_b):
+def resulting_distribution(
+    die_a,
+    die_b,
+):
+    """Calculate the sum distribution of two decoded dice."""
+
     counts = Counter()
 
     for face_a in die_a:
         for face_b in die_b:
-            counts[face_a + face_b] += 1
+            counts[
+                face_a + face_b
+            ] += 1
 
-    return dict(sorted(counts.items()))
+    return dict(
+        sorted(counts.items())
+    )
 
 
 def distribution_error(counts):
+    """Calculate squared error against ordinary dice."""
+
     maximum_sum = VMAX_A + VMAX_B
 
     return sum(
@@ -445,16 +539,29 @@ def distribution_error(counts):
             counts.get(total, 0)
             - TARGET.get(total, 0)
         ) ** 2
-        for total in range(2, maximum_sum + 1)
+        for total in range(
+            2,
+            maximum_sum + 1,
+        )
     )
 
 
 def one_hot_violations(sample):
+    """Count faces that violate their one-hot constraint."""
+
     violations = 0
 
     for face in range(N_FACES):
         selected = sum(
-            int(sample.get(variable_a(face, value), 0))
+            int(
+                sample.get(
+                    variable_a(
+                        face,
+                        value,
+                    ),
+                    0,
+                )
+            )
             for value in VALUES_A
         )
 
@@ -463,7 +570,15 @@ def one_hot_violations(sample):
 
     for face in range(N_FACES):
         selected = sum(
-            int(sample.get(variable_b(face, value), 0))
+            int(
+                sample.get(
+                    variable_b(
+                        face,
+                        value,
+                    ),
+                    0,
+                )
+            )
             for value in VALUES_B
         )
 
@@ -474,10 +589,23 @@ def one_hot_violations(sample):
 
 
 def result_constraint_status(result):
-    return getattr(result, "constraint", None)
+    """Return NEC's constraint status when available."""
+
+    return getattr(
+        result,
+        "constraint",
+        None,
+    )
 
 
-def candidate_from_result(result, attempt_number, seed, result_index):
+def candidate_from_result(
+    result,
+    attempt_number,
+    seed,
+    result_index,
+):
+    """Decode and validate one NEC result."""
+
     sample = result.spin
 
     die_a, valid_a, selections_a = decode_die(
@@ -495,14 +623,31 @@ def candidate_from_result(result, attempt_number, seed, result_index):
     if not valid_a or not valid_b:
         print(
             f"Rejected attempt {attempt_number}, "
-            f"result {result_index}: invalid one-hot decoding."
+            f"result {result_index}: "
+            f"invalid one-hot decoding."
         )
-        print("NEC constraint status:", result_constraint_status(result))
-        print("Die A selections:", selections_a)
-        print("Die B selections:", selections_b)
+
+        print(
+            "NEC constraint status:",
+            result_constraint_status(result),
+        )
+
+        print(
+            "Die A selections:",
+            selections_a,
+        )
+
+        print(
+            "Die B selections:",
+            selections_b,
+        )
+
         return None
 
-    counts = resulting_distribution(die_a, die_b)
+    counts = resulting_distribution(
+        die_a,
+        die_b,
+    )
 
     return {
         "result": result,
@@ -512,17 +657,47 @@ def candidate_from_result(result, attempt_number, seed, result_index):
         "die_a": die_a,
         "die_b": die_b,
         "counts": counts,
-        "distribution_error": distribution_error(counts),
+        "distribution_error": (
+            distribution_error(counts)
+        ),
         "energy": float(result.energy),
-        "one_hot_violations": one_hot_violations(sample),
-        "constraint": result_constraint_status(result),
-        "time": getattr(result, "time", None),
+        "one_hot_violations": (
+            one_hot_violations(sample)
+        ),
+        "constraint": (
+            result_constraint_status(result)
+        ),
+        "time": getattr(
+            result,
+            "time",
+            None,
+        ),
     }
 
 
-def is_expected_sicherman_pair(die_a, die_b):
-    expected_a = [1, 2, 2, 3, 3, 4]
-    expected_b = [1, 3, 4, 5, 6, 8]
+def is_expected_sicherman_pair(
+    die_a,
+    die_b,
+):
+    """Check for the expected nontrivial Sicherman pair."""
+
+    expected_a = [
+        1,
+        2,
+        2,
+        3,
+        3,
+        4,
+    ]
+
+    expected_b = [
+        1,
+        3,
+        4,
+        5,
+        6,
+        8,
+    ]
 
     return (
         sorted(die_a) == expected_a
@@ -531,14 +706,18 @@ def is_expected_sicherman_pair(die_a, die_b):
 
 
 # ======================================================================
-# Prepare model
+# Prepare the QUBO
 # ======================================================================
 
 print("=" * 70)
-print("SICHERMAN DICE - NEC VECTOR ANNEALING")
+print(
+    "SICHERMAN DICE - "
+    "NEC VECTOR ANNEALING"
+)
 print("=" * 70)
 
 print("\nPreparing QUBO...")
+
 prepared = prepare_qubo()
 
 qubo = prepared["qubo"]
@@ -550,11 +729,16 @@ preparation_time = prepared["time"]
 all_variable_names = set()
 
 for variable_1, variable_2 in qubo:
-    all_variable_names.add(variable_1)
-    all_variable_names.add(variable_2)
+    all_variable_names.add(
+        variable_1
+    )
+    all_variable_names.add(
+        variable_2
+    )
 
 auxiliary_variable_names = (
-    all_variable_names - ORIGINAL_VARIABLE_NAMES
+    all_variable_names
+    - ORIGINAL_VARIABLE_NAMES
 )
 
 linear_terms = sum(
@@ -571,40 +755,111 @@ quadratic_terms = sum(
 
 print("\nQUBO statistics")
 print("-" * 70)
-print(f"Original logical variables: {len(ORIGINAL_VARIABLE_NAMES)}")
-print(f"Auxiliary variables:        {len(auxiliary_variable_names)}")
-print(f"Total QUBO variables:       {len(all_variable_names)}")
-print(f"Linear QUBO terms:          {linear_terms}")
-print(f"Quadratic QUBO terms:       {quadratic_terms}")
-print(f"Total nonzero QUBO terms:   {len(qubo)}")
-print(f"QUBO offset:                {offset}")
-print(f"QUBO cache used:            {cache_used}")
-print(f"QUBO preparation time:      {preparation_time:.4f} seconds")
 
-invalid_terms = [term for term in qubo if len(term) != 2]
+print(
+    f"Original logical variables: "
+    f"{len(ORIGINAL_VARIABLE_NAMES)}"
+)
+
+print(
+    f"Auxiliary variables:        "
+    f"{len(auxiliary_variable_names)}"
+)
+
+print(
+    f"Total QUBO variables:       "
+    f"{len(all_variable_names)}"
+)
+
+print(
+    f"Linear QUBO terms:          "
+    f"{linear_terms}"
+)
+
+print(
+    f"Quadratic QUBO terms:       "
+    f"{quadratic_terms}"
+)
+
+print(
+    f"Total nonzero QUBO terms:   "
+    f"{len(qubo)}"
+)
+
+print(
+    f"QUBO offset:                "
+    f"{offset}"
+)
+
+print(
+    f"QUBO cache used:            "
+    f"{cache_used}"
+)
+
+print(
+    f"QUBO preparation time:      "
+    f"{preparation_time:.4f} seconds"
+)
+
+invalid_terms = [
+    term
+    for term in qubo
+    if len(term) != 2
+]
 
 if invalid_terms:
-    raise RuntimeError("The compiled model contains invalid QUBO terms.")
+    raise RuntimeError(
+        "The compiled model contains "
+        "invalid QUBO terms."
+    )
 
-print("\nQuadratization verification: PASSED")
+print(
+    "\nQuadratization verification: "
+    "PASSED"
+)
 
 one_hot_groups = build_one_hot_groups()
-spin_list = sorted(all_variable_names)
+spin_list = sorted(
+    all_variable_names
+)
 
 
 # ======================================================================
-# Run several fast attempts
+# Run several fast NEC attempts
 # ======================================================================
 
-print("\nPreparing NEC Vector Annealing...")
-print(f"Base seed:                  {BASE_SEED}")
-print(f"Maximum attempts:           {ARGS.attempts}")
-print(f"Reads per attempt:          {ARGS.reads}")
-print(f"Results per attempt:        {ARGS.results}")
-print(f"Sweeps per read:            {ARGS.sweeps}")
+print(
+    "\nPreparing NEC Vector Annealing..."
+)
+
+print(
+    f"Base seed:                  "
+    f"{BASE_SEED}"
+)
+
+print(
+    f"Maximum attempts:           "
+    f"{ARGS.attempts}"
+)
+
+print(
+    f"Reads per attempt:          "
+    f"{ARGS.reads}"
+)
+
+print(
+    f"Results per attempt:        "
+    f"{ARGS.results}"
+)
+
+print(
+    f"Sweeps per read:            "
+    f"{ARGS.sweeps}"
+)
 
 best_candidate = None
 exact_candidate = None
+
 total_annealing_wall_time = 0.0
 attempts_completed = 0
 
@@ -614,7 +869,9 @@ with tempfile.TemporaryDirectory(
     prefix="sicherman_nec_va_"
 ) as nec_work_directory:
     try:
-        os.chdir(nec_work_directory)
+        os.chdir(
+            nec_work_directory
+        )
 
         va_model = VectorAnnealing.model(
             qubo,
@@ -625,17 +882,35 @@ with tempfile.TemporaryDirectory(
 
         sampler = VectorAnnealing.sampler()
 
-        for attempt_index in range(ARGS.attempts):
-            attempt_number = attempt_index + 1
-            attempt_seed = BASE_SEED + attempt_index
-            initial_spin = build_valid_initial_spin(attempt_seed)
-
-            print(
-                f"\nAttempt {attempt_number}/{ARGS.attempts} "
-                f"using seed {attempt_seed}..."
+        for attempt_index in range(
+            ARGS.attempts
+        ):
+            attempt_number = (
+                attempt_index + 1
             )
 
-            attempt_start = time.perf_counter()
+            attempt_seed = (
+                BASE_SEED
+                + attempt_index
+            )
+
+            initial_spin = (
+                build_valid_initial_spin(
+                    attempt_seed
+                )
+            )
+
+            print(
+                f"\nAttempt "
+                f"{attempt_number}/"
+                f"{ARGS.attempts} "
+                f"using seed "
+                f"{attempt_seed}..."
+            )
+
+            attempt_start = (
+                time.perf_counter()
+            )
 
             results = sampler.sample(
                 va_model,
@@ -648,27 +923,45 @@ with tempfile.TemporaryDirectory(
                 init_spin=initial_spin,
             )
 
-            attempt_wall_time = time.perf_counter() - attempt_start
-            total_annealing_wall_time += attempt_wall_time
+            attempt_wall_time = (
+                time.perf_counter()
+                - attempt_start
+            )
+
+            total_annealing_wall_time += (
+                attempt_wall_time
+            )
+
             attempts_completed += 1
 
             if not results:
-                print("NEC returned no results for this attempt.")
+                print(
+                    "NEC returned no results "
+                    "for this attempt."
+                )
                 continue
 
             sorted_results = sorted(
                 results,
-                key=lambda result: float(result.energy),
+                key=lambda result: float(
+                    result.energy
+                ),
             )
 
             attempt_best = None
 
-            for result_index, result in enumerate(sorted_results):
-                candidate = candidate_from_result(
-                    result,
-                    attempt_number,
-                    attempt_seed,
-                    result_index,
+            for (
+                result_index,
+                result,
+            ) in enumerate(sorted_results):
+
+                candidate = (
+                    candidate_from_result(
+                        result,
+                        attempt_number,
+                        attempt_seed,
+                        result_index,
+                    )
                 )
 
                 if candidate is None:
@@ -676,19 +969,31 @@ with tempfile.TemporaryDirectory(
 
                 if (
                     attempt_best is None
-                    or candidate["distribution_error"]
-                    < attempt_best["distribution_error"]
+                    or candidate[
+                        "distribution_error"
+                    ]
+                    < attempt_best[
+                        "distribution_error"
+                    ]
                 ):
                     attempt_best = candidate
 
                 if (
                     best_candidate is None
-                    or candidate["distribution_error"]
-                    < best_candidate["distribution_error"]
+                    or candidate[
+                        "distribution_error"
+                    ]
+                    < best_candidate[
+                        "distribution_error"
+                    ]
                 ):
                     best_candidate = candidate
 
-                if candidate["distribution_error"] == 0:
+                if (
+                    candidate[
+                        "distribution_error"
+                    ] == 0
+                ):
                     exact_candidate = candidate
                     break
 
@@ -697,21 +1002,27 @@ with tempfile.TemporaryDirectory(
                     f"Attempt error:              "
                     f"{attempt_best['distribution_error']}"
                 )
+
                 print(
                     f"Attempt wall time:          "
                     f"{attempt_wall_time:.4f} seconds"
                 )
 
             if exact_candidate is not None:
-                print("Exact solution found; stopping additional attempts.")
+                print(
+                    "Exact solution found; "
+                    "stopping additional attempts."
+                )
                 break
 
     finally:
-        os.chdir(original_directory)
+        os.chdir(
+            original_directory
+        )
 
 
 # ======================================================================
-# Print best result
+# Print the best result
 # ======================================================================
 
 print("\n" + "=" * 70)
@@ -719,7 +1030,10 @@ print("RESULT")
 print("=" * 70)
 
 if best_candidate is None:
-    print("No returned sample satisfied the one-hot constraints.")
+    print(
+        "No returned sample satisfied "
+        "the one-hot constraints."
+    )
     sys.exit(1)
 
 selected_candidate = (
@@ -728,29 +1042,60 @@ selected_candidate = (
     else best_candidate
 )
 
-selected_result = selected_candidate["result"]
+selected_result = (
+    selected_candidate["result"]
+)
+
 die_a = selected_candidate["die_a"]
 die_b = selected_candidate["die_b"]
 counts = selected_candidate["counts"]
-match = selected_candidate["distribution_error"] == 0
 
-print(f"Attempt number:              {selected_candidate['attempt']}")
-print(f"Seed:                        {selected_candidate['seed']}")
-print(f"Result number:               {selected_candidate['index']}")
-print(f"NEC-reported QUBO energy:    {selected_candidate['energy']}")
+match = (
+    selected_candidate[
+        "distribution_error"
+    ] == 0
+)
+
+print(
+    f"Attempt number:              "
+    f"{selected_candidate['attempt']}"
+)
+
+print(
+    f"Seed:                        "
+    f"{selected_candidate['seed']}"
+)
+
+print(
+    f"Result number:               "
+    f"{selected_candidate['index']}"
+)
+
+print(
+    f"NEC-reported QUBO energy:    "
+    f"{selected_candidate['energy']}"
+)
+
 print(
     f"Distribution error:         "
     f"{selected_candidate['distribution_error']}"
 )
+
 print(
     f"One-hot violations:         "
     f"{selected_candidate['one_hot_violations']}"
 )
+
 print(
     f"NEC constraint status:      "
     f"{selected_candidate['constraint']}"
 )
-print(f"Attempts completed:          {attempts_completed}")
+
+print(
+    f"Attempts completed:          "
+    f"{attempts_completed}"
+)
+
 print(
     f"Total annealing wall time:  "
     f"{total_annealing_wall_time:.4f} seconds"
@@ -762,17 +1107,36 @@ if selected_candidate["time"] is not None:
         f"{selected_candidate['time']} seconds"
     )
 
-print(f"\nDie A faces: {sorted(die_a)}")
-print(f"Die B faces: {sorted(die_b)}")
+print(
+    f"\nDie A faces: "
+    f"{sorted(die_a)}"
+)
+
+print(
+    f"Die B faces: "
+    f"{sorted(die_b)}"
+)
 
 print("\nSum distribution")
 print("-" * 70)
-print("Sum | Obtained | Target | Difference")
+
+print(
+    "Sum | Obtained | "
+    "Target | Difference"
+)
+
 print("-" * 70)
 
 for total in range(2, 13):
-    obtained = counts.get(total, 0)
-    expected = TARGET.get(total, 0)
+    obtained = counts.get(
+        total,
+        0,
+    )
+
+    expected = TARGET.get(
+        total,
+        0,
+    )
 
     print(
         f"{total:>3} | "
@@ -788,15 +1152,30 @@ outside_target = {
 }
 
 print("\nTarget distribution:")
-print(dict(sorted(TARGET.items())))
+
+print(
+    dict(
+        sorted(
+            TARGET.items()
+        )
+    )
+)
 
 print("\nObtained distribution:")
+
 print(counts)
 
-print(f"\nExact distribution match: {match}")
+print(
+    f"\nExact distribution match: "
+    f"{match}"
+)
 
 if outside_target:
-    print("Unexpected sums outside 2 through 12:", outside_target)
+    print(
+        "Unexpected sums outside "
+        "2 through 12:",
+        outside_target,
+    )
 
 
 # ======================================================================
@@ -805,25 +1184,38 @@ if outside_target:
 
 if compiled_model is None:
     print(
-        "PyQUBO diagnostic decoding: SKIPPED "
+        "PyQUBO diagnostic decoding: "
+        "SKIPPED "
         "(QUBO was loaded from cache)"
     )
 
 else:
     try:
-        decoded_sample = compiled_model.decode_sample(
-            selected_result.spin,
-            vartype="BINARY",
+        decoded_sample = (
+            compiled_model.decode_sample(
+                selected_result.spin,
+                vartype="BINARY",
+            )
         )
 
-        print(f"PyQUBO decoded energy:       {decoded_sample.energy}")
+        print(
+            f"PyQUBO decoded energy:       "
+            f"{decoded_sample.energy}"
+        )
+
         print(
             "Broken PyQUBO constraints:   ",
-            decoded_sample.constraints(only_broken=True),
+            decoded_sample.constraints(
+                only_broken=True
+            ),
         )
 
     except Exception as error:
-        print("PyQUBO diagnostic decoding unavailable:", error)
+        print(
+            "PyQUBO diagnostic decoding "
+            "unavailable:",
+            error,
+        )
 
 
 # ======================================================================
@@ -833,20 +1225,35 @@ else:
 print("\n" + "=" * 70)
 
 if not match:
-    print("No exact target-distribution solution was found.")
     print(
-        "Increase --attempts first. Increase --sweeps only if additional "
-        "seeds still do not reach energy 0."
+        "No exact Sicherman-dice "
+        "solution was found."
     )
+
+    print(
+        "Increase --attempts first. "
+        "Increase --sweeps only if "
+        "additional seeds still do not "
+        "reach energy 0."
+    )
+
     sys.exit(2)
 
-if not is_expected_sicherman_pair(die_a, die_b):
+if not is_expected_sicherman_pair(
+    die_a,
+    die_b,
+):
     print(
-        "An exact distribution match was found, but it was not "
-        "the expected nontrivial Sicherman pair."
+        "An exact distribution match was "
+        "found, but it was not the expected "
+        "nontrivial Sicherman pair."
     )
+
     sys.exit(3)
 
-print("NONTRIVIAL SICHERMAN SOLUTION FOUND AND VERIFIED.")
+print(
+    "NONTRIVIAL SICHERMAN SOLUTION "
+    "FOUND AND VERIFIED."
+)
 
 print("=" * 70)
