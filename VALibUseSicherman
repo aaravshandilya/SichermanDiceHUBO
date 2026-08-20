@@ -12,10 +12,10 @@ This version:
 
 Examples:
 
-    python3.8 sicherman_nec_qubo.py
-    python3.8 sicherman_nec_qubo.py --seed 137
-    python3.8 sicherman_nec_qubo.py --seed 137 --attempts 5
-    python3.8 sicherman_nec_qubo.py --attempts 1 --sweeps 500
+    python3.8 VALibUseSicherman
+    python3.8 VALibUseSicherman --seed 137
+    python3.8 VALibUseSicherman --seed 137 --attempts 5
+    python3.8 VALibUseSicherman --attempts 1 --sweeps 500
 """
 
 from collections import Counter
