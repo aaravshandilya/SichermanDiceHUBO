@@ -1,0 +1,1189 @@
+"""
+Ordinary and Sicherman Dice using NEC Vector Annealing
+======================================================
+
+This model allows both exact solutions:
+
+    Ordinary dice:
+        [1, 2, 3, 4, 5, 6]
+        [1, 2, 3, 4, 5, 6]
+
+    Nontrivial Sicherman dice:
+        [1, 2, 2, 3, 3, 4]
+        [1, 3, 4, 5, 6, 8]
+
+The program tries several seeds, records exact solutions, and can stop after
+finding any exact solution, a requested solution type, or both solution types.
+
+Examples:
+
+    python3.8 sicherman_nec_both.py
+    python3.8 sicherman_nec_both.py --target standard --attempts 10
+    python3.8 sicherman_nec_both.py --target sicherman --attempts 20
+    python3.8 sicherman_nec_both.py --target both --attempts 30
+    python3.8 sicherman_nec_both.py --seed 137 --target both
+"""
+
+from collections import Counter
+import argparse
+import os
+import pickle
+import random
+import sys
+import tempfile
+import time
+
+try:
+    from pyqubo import Binary
+except ImportError as exc:
+    raise SystemExit(
+        "PyQUBO is not available.\n"
+        "Load the NEC/BasePy environment before running this program."
+    ) from exc
+
+try:
+    import VectorAnnealing
+except ImportError as exc:
+    raise SystemExit(
+        "The NEC VectorAnnealing module is not available.\n"
+        "Load the Vector Annealing module before running this program."
+    ) from exc
+
+
+# ======================================================================
+# Model configuration
+# ======================================================================
+
+N_FACES = 6
+
+# These are the smallest bounds that contain both requested solutions.
+#
+# Ordinary dice require labels through 6.
+# The nontrivial Sicherman Die B requires label 8.
+#
+# Removing the unused labels 9, 10, and 11 reduces the QUBO and removes
+# false local minima involving unnecessarily large labels.
+VMAX_A = 6
+VMAX_B = 8
+
+VALUES_A = range(1, VMAX_A + 1)
+VALUES_B = range(1, VMAX_B + 1)
+
+ONE_HOT_PENALTY = 150.0
+
+# Every exact solution matching the ordinary-dice sum distribution must
+# have sum(A faces) + sum(B faces) = 42.
+TOTAL_FACE_SUM_PENALTY = 20.0
+
+REDUCTION_STRENGTH = 1000.0
+
+DEFAULT_NUM_READS = 5
+DEFAULT_NUM_RESULTS = 5
+DEFAULT_NUM_SWEEPS = 1000
+DEFAULT_MAX_ATTEMPTS = 10
+
+NUM_THREADS = -1
+BETA_RANGE = [10.0, 100.0, 200]
+
+# Version 3 distinguishes this strengthened a6/b8 model from all previous
+# cached QUBOs.
+CACHE_VERSION = 3
+
+CACHE_SIGNATURE = {
+    "version": CACHE_VERSION,
+    "n_faces": N_FACES,
+    "vmax_a": VMAX_A,
+    "vmax_b": VMAX_B,
+    "one_hot_penalty": ONE_HOT_PENALTY,
+    "total_face_sum_penalty": TOTAL_FACE_SUM_PENALTY,
+    "reduction_strength": REDUCTION_STRENGTH,
+}
+
+QUBO_CACHE_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    (
+        f".sicherman_qubo_cache_v{CACHE_VERSION}"
+        f"_a{VMAX_A}_b{VMAX_B}.pkl"
+    ),
+)
+
+STANDARD_DIE = [1, 2, 3, 4, 5, 6]
+
+SICHERMAN_DIE_A = [1, 2, 2, 3, 3, 4]
+SICHERMAN_DIE_B = [1, 3, 4, 5, 6, 8]
+
+
+# ======================================================================
+# Command-line arguments
+# ======================================================================
+
+def positive_integer(value):
+    parsed = int(value)
+
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(
+            "value must be at least 1"
+        )
+
+    return parsed
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description="Search for ordinary and/or Sicherman dice."
+    )
+
+    parser.add_argument(
+        "--target",
+        choices=["any", "standard", "sicherman", "both"],
+        default="both",
+        help=(
+            "Exact solution type required before stopping. "
+            "The default is both."
+        ),
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help=(
+            "Base seed. If omitted, a new random base seed is "
+            "generated for each program execution."
+        ),
+    )
+
+    parser.add_argument(
+        "--attempts",
+        type=positive_integer,
+        default=DEFAULT_MAX_ATTEMPTS,
+        help="Maximum number of consecutive seeds to test.",
+    )
+
+    parser.add_argument(
+        "--reads",
+        type=positive_integer,
+        default=DEFAULT_NUM_READS,
+        help="NEC reads per seed.",
+    )
+
+    parser.add_argument(
+        "--results",
+        type=positive_integer,
+        default=DEFAULT_NUM_RESULTS,
+        help="NEC results returned per seed.",
+    )
+
+    parser.add_argument(
+        "--sweeps",
+        type=positive_integer,
+        default=DEFAULT_NUM_SWEEPS,
+        help="NEC sweeps per read.",
+    )
+
+    args = parser.parse_args()
+
+    if args.results > args.reads:
+        parser.error(
+            "--results cannot be greater than --reads"
+        )
+
+    return args
+
+
+ARGS = parse_arguments()
+
+if ARGS.seed is None:
+    BASE_SEED = random.SystemRandom().randrange(
+        1,
+        2_000_000_000,
+    )
+else:
+    BASE_SEED = ARGS.seed
+
+
+# ======================================================================
+# Target distribution
+# ======================================================================
+
+def standard_dice_distribution():
+    target = Counter()
+
+    for value_a in range(1, 7):
+        for value_b in range(1, 7):
+            target[value_a + value_b] += 1
+
+    return dict(target)
+
+
+TARGET_DISTRIBUTION = standard_dice_distribution()
+
+
+# ======================================================================
+# Variable naming
+# ======================================================================
+
+def variable_a(face, value):
+    return f"A_{face}_{value}"
+
+
+def variable_b(face, value):
+    return f"B_{face}_{value}"
+
+
+ORIGINAL_VARIABLE_NAMES = {
+    variable_a(face, value)
+    for face in range(N_FACES)
+    for value in VALUES_A
+}
+
+ORIGINAL_VARIABLE_NAMES.update(
+    variable_b(face, value)
+    for face in range(N_FACES)
+    for value in VALUES_B
+)
+
+
+# ======================================================================
+# QUBO preparation and caching
+# ======================================================================
+
+def load_cached_qubo():
+    try:
+        with open(QUBO_CACHE_FILE, "rb") as cache_file:
+            cached = pickle.load(cache_file)
+
+        if cached.get("signature") != CACHE_SIGNATURE:
+            print(
+                "Ignoring cache because its signature does not match."
+            )
+            return None
+
+        print(f"Loaded cached QUBO: {QUBO_CACHE_FILE}")
+
+        return cached["qubo"], cached["offset"]
+
+    except FileNotFoundError:
+        return None
+
+    except Exception as error:
+        print("Ignoring unreadable QUBO cache:", error)
+        return None
+
+
+def build_symbolic_hamiltonian():
+    x = {
+        (face, value): Binary(variable_a(face, value))
+        for face in range(N_FACES)
+        for value in VALUES_A
+    }
+
+    y = {
+        (face, value): Binary(variable_b(face, value))
+        for face in range(N_FACES)
+        for value in VALUES_B
+    }
+
+    # ------------------------------------------------------------------
+    # Target sum-distribution objective
+    # ------------------------------------------------------------------
+
+    distribution_objective = 0
+    maximum_sum = VMAX_A + VMAX_B
+
+    for total in range(2, maximum_sum + 1):
+        expected_count = TARGET_DISTRIBUTION.get(total, 0)
+        observed_count = 0
+
+        for value_a in VALUES_A:
+            value_b = total - value_a
+
+            if value_b not in VALUES_B:
+                continue
+
+            for face_a in range(N_FACES):
+                for face_b in range(N_FACES):
+                    observed_count += (
+                        x[(face_a, value_a)]
+                        * y[(face_b, value_b)]
+                    )
+
+        distribution_objective += (
+            observed_count - expected_count
+        ) ** 2
+
+    # ------------------------------------------------------------------
+    # One-hot objective
+    # ------------------------------------------------------------------
+
+    one_hot_objective = 0
+
+    for face in range(N_FACES):
+        selected = sum(
+            x[(face, value)]
+            for value in VALUES_A
+        )
+
+        one_hot_objective += (selected - 1) ** 2
+
+    for face in range(N_FACES):
+        selected = sum(
+            y[(face, value)]
+            for value in VALUES_B
+        )
+
+        one_hot_objective += (selected - 1) ** 2
+
+    # ------------------------------------------------------------------
+    # Necessary total-face-sum condition
+    # ------------------------------------------------------------------
+    #
+    # The desired outcome distribution has mean 7.
+    #
+    # The mean of Die A plus the mean of Die B must therefore equal 7:
+    #
+    #     sum(A)/6 + sum(B)/6 = 7
+    #
+    # Therefore:
+    #
+    #     sum(A) + sum(B) = 42
+    #
+    # This is redundant for an exact solution, but it strengthens the
+    # QUBO around near-solutions. In particular, the observed state
+    #
+    #     [1,2,3,4,5,6] and [1,2,3,4,5,7]
+    #
+    # has total 43 and is directly penalized.
+    # ------------------------------------------------------------------
+
+    total_face_sum = sum(
+        value * x[(face, value)]
+        for face in range(N_FACES)
+        for value in VALUES_A
+    )
+
+    total_face_sum += sum(
+        value * y[(face, value)]
+        for face in range(N_FACES)
+        for value in VALUES_B
+    )
+
+    total_face_sum_objective = (
+        total_face_sum - 42
+    ) ** 2
+
+    return (
+        distribution_objective
+        + ONE_HOT_PENALTY * one_hot_objective
+        + TOTAL_FACE_SUM_PENALTY
+        * total_face_sum_objective
+    )
+
+
+def save_qubo_cache(qubo, offset):
+    try:
+        with open(QUBO_CACHE_FILE, "wb") as cache_file:
+            pickle.dump(
+                {
+                    "signature": CACHE_SIGNATURE,
+                    "qubo": qubo,
+                    "offset": offset,
+                },
+                cache_file,
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
+
+        print(f"Saved QUBO cache: {QUBO_CACHE_FILE}")
+
+    except Exception as error:
+        print("Could not save QUBO cache:", error)
+
+
+def prepare_qubo():
+    start = time.perf_counter()
+    cached = load_cached_qubo()
+
+    if cached is not None:
+        qubo, offset = cached
+
+        return (
+            qubo,
+            offset,
+            None,
+            True,
+            time.perf_counter() - start,
+        )
+
+    print(
+        "No matching cache found; building symbolic HUBO..."
+    )
+
+    hamiltonian = build_symbolic_hamiltonian()
+
+    print("Quadratizing HUBO with PyQUBO...")
+
+    compiled_model = hamiltonian.compile(
+        strength=REDUCTION_STRENGTH
+    )
+
+    qubo, offset = compiled_model.to_qubo()
+
+    save_qubo_cache(qubo, offset)
+
+    return (
+        qubo,
+        offset,
+        compiled_model,
+        False,
+        time.perf_counter() - start,
+    )
+
+
+# ======================================================================
+# NEC one-hot groups and initial states
+# ======================================================================
+
+def build_one_hot_groups():
+    groups = []
+
+    for face in range(N_FACES):
+        groups.append(
+            [
+                variable_a(face, value)
+                for value in VALUES_A
+            ]
+        )
+
+    for face in range(N_FACES):
+        groups.append(
+            [
+                variable_b(face, value)
+                for value in VALUES_B
+            ]
+        )
+
+    return groups
+
+
+def build_valid_initial_spin(seed):
+    """
+    Build a random initial state that satisfies every one-hot constraint.
+
+    This function does not initialize either known exact solution.
+    """
+
+    rng = random.Random(seed)
+    initial_state = {}
+
+    for face in range(N_FACES):
+        chosen = rng.choice(list(VALUES_A))
+
+        for value in VALUES_A:
+            initial_state[
+                variable_a(face, value)
+            ] = int(value == chosen)
+
+    for face in range(N_FACES):
+        chosen = rng.choice(list(VALUES_B))
+
+        for value in VALUES_B:
+            initial_state[
+                variable_b(face, value)
+            ] = int(value == chosen)
+
+    return initial_state
+
+
+# ======================================================================
+# Result decoding
+# ======================================================================
+
+def decode_die(sample, prefix, allowed_values):
+    faces = []
+
+    for face in range(N_FACES):
+        chosen = [
+            value
+            for value in allowed_values
+            if int(
+                sample.get(
+                    f"{prefix}_{face}_{value}",
+                    0,
+                )
+            ) == 1
+        ]
+
+        if len(chosen) != 1:
+            return None
+
+        faces.append(chosen[0])
+
+    return faces
+
+
+def resulting_distribution(die_a, die_b):
+    counts = Counter()
+
+    for value_a in die_a:
+        for value_b in die_b:
+            counts[value_a + value_b] += 1
+
+    return dict(sorted(counts.items()))
+
+
+def distribution_error(counts):
+    maximum_sum = VMAX_A + VMAX_B
+
+    return sum(
+        (
+            counts.get(total, 0)
+            - TARGET_DISTRIBUTION.get(total, 0)
+        ) ** 2
+        for total in range(2, maximum_sum + 1)
+    )
+
+
+def classify_solution(die_a, die_b):
+    sorted_a = sorted(die_a)
+    sorted_b = sorted(die_b)
+
+    if (
+        sorted_a == STANDARD_DIE
+        and sorted_b == STANDARD_DIE
+    ):
+        return "standard"
+
+    if (
+        sorted_a == SICHERMAN_DIE_A
+        and sorted_b == SICHERMAN_DIE_B
+    ):
+        return "sicherman"
+
+    return "other"
+
+
+def decode_candidate(
+    result,
+    attempt,
+    seed,
+    result_index,
+):
+    die_a = decode_die(
+        result.spin,
+        "A",
+        VALUES_A,
+    )
+
+    die_b = decode_die(
+        result.spin,
+        "B",
+        VALUES_B,
+    )
+
+    if die_a is None or die_b is None:
+        return None
+
+    counts = resulting_distribution(
+        die_a,
+        die_b,
+    )
+
+    error = distribution_error(counts)
+    total_face_sum = sum(die_a) + sum(die_b)
+
+    if error == 0:
+        solution_type = classify_solution(
+            die_a,
+            die_b,
+        )
+    else:
+        solution_type = None
+
+    return {
+        "result": result,
+        "attempt": attempt,
+        "seed": seed,
+        "result_index": result_index,
+        "die_a": die_a,
+        "die_b": die_b,
+        "counts": counts,
+        "error": error,
+        "total_face_sum": total_face_sum,
+        "energy": float(result.energy),
+        "constraint": getattr(
+            result,
+            "constraint",
+            None,
+        ),
+        "solve_time": getattr(
+            result,
+            "time",
+            None,
+        ),
+        "type": solution_type,
+    }
+
+
+# ======================================================================
+# Stopping logic
+# ======================================================================
+
+def target_reached(exact_solutions):
+    found_standard = "standard" in exact_solutions
+    found_sicherman = "sicherman" in exact_solutions
+
+    if ARGS.target == "any":
+        return found_standard or found_sicherman
+
+    if ARGS.target == "standard":
+        return found_standard
+
+    if ARGS.target == "sicherman":
+        return found_sicherman
+
+    return found_standard and found_sicherman
+
+
+# ======================================================================
+# Result printing
+# ======================================================================
+
+def print_candidate(title, candidate):
+    print("\n" + "=" * 70)
+    print(title)
+    print("=" * 70)
+
+    print(
+        f"Solution type:               "
+        f"{candidate['type']}"
+    )
+
+    print(
+        f"Attempt number:              "
+        f"{candidate['attempt']}"
+    )
+
+    print(
+        f"Seed:                        "
+        f"{candidate['seed']}"
+    )
+
+    print(
+        f"Result number:               "
+        f"{candidate['result_index']}"
+    )
+
+    print(
+        f"NEC-reported QUBO energy:    "
+        f"{candidate['energy']}"
+    )
+
+    print(
+        f"Distribution error:         "
+        f"{candidate['error']}"
+    )
+
+    print(
+        f"Total face sum:             "
+        f"{candidate['total_face_sum']} "
+        f"(target 42)"
+    )
+
+    print(
+        f"NEC constraint status:      "
+        f"{candidate['constraint']}"
+    )
+
+    if candidate["solve_time"] is not None:
+        print(
+            f"NEC-reported solve time:    "
+            f"{candidate['solve_time']} seconds"
+        )
+
+    print(
+        f"\nDie A faces: "
+        f"{sorted(candidate['die_a'])}"
+    )
+
+    print(
+        f"Die B faces: "
+        f"{sorted(candidate['die_b'])}"
+    )
+
+    print(
+        "\nSum | Obtained | Target | Difference"
+    )
+
+    print("-" * 70)
+
+    for total in range(2, 13):
+        obtained = candidate["counts"].get(
+            total,
+            0,
+        )
+
+        expected = TARGET_DISTRIBUTION.get(
+            total,
+            0,
+        )
+
+        print(
+            f"{total:>3} | "
+            f"{obtained:>8} | "
+            f"{expected:>6} | "
+            f"{obtained - expected:>10}"
+        )
+
+    outside = {
+        total: count
+        for total, count in candidate["counts"].items()
+        if total < 2 or total > 12
+    }
+
+    print(
+        "\nExact distribution match:",
+        candidate["error"] == 0,
+    )
+
+    if outside:
+        print(
+            "Unexpected sums outside 2 through 12:",
+            outside,
+        )
+
+
+# ======================================================================
+# Prepare the QUBO
+# ======================================================================
+
+print("=" * 70)
+print(
+    "ORDINARY AND SICHERMAN DICE - "
+    "NEC VECTOR ANNEALING"
+)
+print("=" * 70)
+
+print("\nPreparing QUBO...")
+
+(
+    qubo,
+    offset,
+    compiled_model,
+    cache_used,
+    preparation_time,
+) = prepare_qubo()
+
+all_variable_names = set()
+
+for variable_1, variable_2 in qubo:
+    all_variable_names.add(variable_1)
+    all_variable_names.add(variable_2)
+
+auxiliary_variable_names = (
+    all_variable_names
+    - ORIGINAL_VARIABLE_NAMES
+)
+
+linear_terms = sum(
+    1
+    for variable_1, variable_2 in qubo
+    if variable_1 == variable_2
+)
+
+quadratic_terms = sum(
+    1
+    for variable_1, variable_2 in qubo
+    if variable_1 != variable_2
+)
+
+print("\nQUBO statistics")
+print("-" * 70)
+
+print(
+    f"Original logical variables: "
+    f"{len(ORIGINAL_VARIABLE_NAMES)}"
+)
+
+print(
+    f"Auxiliary variables:        "
+    f"{len(auxiliary_variable_names)}"
+)
+
+print(
+    f"Total QUBO variables:       "
+    f"{len(all_variable_names)}"
+)
+
+print(
+    f"Linear QUBO terms:          "
+    f"{linear_terms}"
+)
+
+print(
+    f"Quadratic QUBO terms:       "
+    f"{quadratic_terms}"
+)
+
+print(
+    f"Total nonzero QUBO terms:   "
+    f"{len(qubo)}"
+)
+
+print(
+    f"QUBO offset:                "
+    f"{offset}"
+)
+
+print(
+    f"QUBO cache used:            "
+    f"{cache_used}"
+)
+
+print(
+    f"QUBO preparation time:      "
+    f"{preparation_time:.4f} seconds"
+)
+
+if any(len(term) != 2 for term in qubo):
+    raise RuntimeError(
+        "The compiled model contains invalid QUBO terms."
+    )
+
+print("\nQuadratization verification: PASSED")
+
+
+# ======================================================================
+# Run NEC seed search
+# ======================================================================
+
+print("\nSearch configuration")
+print("-" * 70)
+
+print(
+    f"Target:                      "
+    f"{ARGS.target}"
+)
+
+print(
+    f"Base seed:                   "
+    f"{BASE_SEED}"
+)
+
+print(
+    f"Maximum attempts:            "
+    f"{ARGS.attempts}"
+)
+
+print(
+    f"Reads per attempt:           "
+    f"{ARGS.reads}"
+)
+
+print(
+    f"Results per attempt:         "
+    f"{ARGS.results}"
+)
+
+print(
+    f"Sweeps per read:             "
+    f"{ARGS.sweeps}"
+)
+
+one_hot_groups = build_one_hot_groups()
+spin_list = sorted(all_variable_names)
+
+exact_solutions = {}
+best_candidate = None
+
+attempts_completed = 0
+total_wall_time = 0.0
+
+original_directory = os.getcwd()
+
+with tempfile.TemporaryDirectory(
+    prefix="sicherman_nec_both_"
+) as nec_work_directory:
+    try:
+        os.chdir(nec_work_directory)
+
+        va_model = VectorAnnealing.model(
+            qubo,
+            offset,
+            onehot=one_hot_groups,
+            spin_list=spin_list,
+        )
+
+        sampler = VectorAnnealing.sampler()
+
+        for attempt_index in range(ARGS.attempts):
+            attempt_number = attempt_index + 1
+            attempt_seed = (
+                BASE_SEED + attempt_index
+            )
+
+            initial_spin = build_valid_initial_spin(
+                attempt_seed
+            )
+
+            print(
+                f"\nAttempt "
+                f"{attempt_number}/{ARGS.attempts} "
+                f"using seed {attempt_seed}..."
+            )
+
+            attempt_start = time.perf_counter()
+
+            results = sampler.sample(
+                va_model,
+                num_reads=ARGS.reads,
+                num_results=ARGS.results,
+                num_sweeps=ARGS.sweeps,
+                num_threads=NUM_THREADS,
+                beta_range=BETA_RANGE,
+                seed=attempt_seed,
+                init_spin=initial_spin,
+            )
+
+            attempt_time = (
+                time.perf_counter()
+                - attempt_start
+            )
+
+            attempts_completed += 1
+            total_wall_time += attempt_time
+
+            if not results:
+                print(
+                    "NEC returned no results "
+                    "for this attempt."
+                )
+                continue
+
+            attempt_best = None
+            exact_types_this_attempt = set()
+
+            sorted_results = sorted(
+                results,
+                key=lambda item: float(item.energy),
+            )
+
+            for result_index, result in enumerate(
+                sorted_results
+            ):
+                candidate = decode_candidate(
+                    result,
+                    attempt_number,
+                    attempt_seed,
+                    result_index,
+                )
+
+                if candidate is None:
+                    continue
+
+                candidate_rank = (
+                    candidate["error"],
+                    abs(
+                        candidate["total_face_sum"]
+                        - 42
+                    ),
+                    candidate["energy"],
+                )
+
+                if attempt_best is None:
+                    attempt_best = candidate
+                else:
+                    attempt_best_rank = (
+                        attempt_best["error"],
+                        abs(
+                            attempt_best[
+                                "total_face_sum"
+                            ] - 42
+                        ),
+                        attempt_best["energy"],
+                    )
+
+                    if candidate_rank < attempt_best_rank:
+                        attempt_best = candidate
+
+                if best_candidate is None:
+                    best_candidate = candidate
+                else:
+                    best_rank = (
+                        best_candidate["error"],
+                        abs(
+                            best_candidate[
+                                "total_face_sum"
+                            ] - 42
+                        ),
+                        best_candidate["energy"],
+                    )
+
+                    if candidate_rank < best_rank:
+                        best_candidate = candidate
+
+                solution_type = candidate["type"]
+
+                if (
+                    candidate["error"] == 0
+                    and candidate["total_face_sum"] == 42
+                    and solution_type
+                    in {"standard", "sicherman"}
+                ):
+                    exact_types_this_attempt.add(
+                        solution_type
+                    )
+
+                    if (
+                        solution_type
+                        not in exact_solutions
+                    ):
+                        exact_solutions[
+                            solution_type
+                        ] = candidate
+
+                        print(
+                            f"Recorded exact "
+                            f"{solution_type} solution "
+                            f"with seed {attempt_seed}."
+                        )
+
+            if attempt_best is not None:
+                print(
+                    f"Attempt error:              "
+                    f"{attempt_best['error']}"
+                )
+
+                print(
+                    f"Attempt total face sum:     "
+                    f"{attempt_best['total_face_sum']}"
+                )
+
+                print(
+                    f"Attempt QUBO energy:        "
+                    f"{attempt_best['energy']}"
+                )
+
+                print(
+                    f"Attempt wall time:          "
+                    f"{attempt_time:.4f} seconds"
+                )
+
+            if exact_types_this_attempt:
+                print(
+                    "Exact types this attempt:    "
+                    + ", ".join(
+                        sorted(
+                            exact_types_this_attempt
+                        )
+                    )
+                )
+
+            if target_reached(exact_solutions):
+                print(
+                    "Requested target reached; "
+                    "stopping search."
+                )
+                break
+
+    finally:
+        os.chdir(original_directory)
+
+
+# ======================================================================
+# Final report
+# ======================================================================
+
+print("\n" + "=" * 70)
+print("SEARCH SUMMARY")
+print("=" * 70)
+
+print(
+    f"Attempts completed:          "
+    f"{attempts_completed}"
+)
+
+print(
+    f"Total annealing wall time:  "
+    f"{total_wall_time:.4f} seconds"
+)
+
+print(
+    f"Standard solution found:     "
+    f"{'standard' in exact_solutions}"
+)
+
+print(
+    f"Sicherman solution found:    "
+    f"{'sicherman' in exact_solutions}"
+)
+
+if "standard" in exact_solutions:
+    print_candidate(
+        "EXACT STANDARD-DICE SOLUTION",
+        exact_solutions["standard"],
+    )
+
+if "sicherman" in exact_solutions:
+    print_candidate(
+        "EXACT SICHERMAN-DICE SOLUTION",
+        exact_solutions["sicherman"],
+    )
+
+if (
+    not exact_solutions
+    and best_candidate is not None
+):
+    print_candidate(
+        "BEST APPROXIMATE SOLUTION",
+        best_candidate,
+    )
+
+if (
+    compiled_model is not None
+    and best_candidate is not None
+):
+    try:
+        decoded = compiled_model.decode_sample(
+            best_candidate["result"].spin,
+            vartype="BINARY",
+        )
+
+        print(
+            "\nPyQUBO decoded energy:",
+            decoded.energy,
+        )
+
+        print(
+            "Broken PyQUBO constraints:",
+            decoded.constraints(
+                only_broken=True
+            ),
+        )
+
+    except Exception as error:
+        print(
+            "PyQUBO diagnostic unavailable:",
+            error,
+        )
+else:
+    print(
+        "\nPyQUBO diagnostic skipped "
+        "because the cache was used."
+    )
+
+if not target_reached(exact_solutions):
+    print(
+        "\nThe requested target was not found."
+    )
+
+    print(
+        "Try additional fresh seeds before "
+        "increasing the sweep count."
+    )
+
+    sys.exit(2)
+
+print(
+    "\nREQUESTED SOLUTION TARGET "
+    "FOUND AND VERIFIED."
+)
